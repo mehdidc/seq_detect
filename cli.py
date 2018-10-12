@@ -21,6 +21,7 @@ from torchvision.models import vgg16
 from torchvision import models
 import cv2
 from torchvision.datasets.folder import default_loader
+from scipy.special import expit as sigmoid
 
 cudnn.benchmark = True
 
@@ -31,6 +32,19 @@ def train(*, config='config', resume=False):
     num_epoch = cfg['num_epoch']
     debug = cfg['debug']
     out_folder = cfg['out_folder']
+    folders = [
+        'train', 
+        'train_mask', 
+        'eval_train', 
+        'eval_train_mask', 
+        'eval_valid', 
+        'eval_valid_mask'
+    ]
+    for f in folders:
+        try:
+            os.makedirs(os.path.join(out_folder, f))
+        except OSError:
+            pass
     (train_dataset, valid_dataset), (train_evaluation, valid_evaluation) = _build_dataset(cfg)
     
     print('Done loading dataset annotations.')
@@ -92,7 +106,7 @@ def train(*, config='config', resume=False):
         base = cfg['base']
         if base == 'vgg16':
             base = vgg16(pretrained=True).features.cuda()
-            input_size = 512
+            nb_feature_maps = 512
         elif base.startswith('resnet'):
             model_class = getattr(models, base)
             resnet = model_class(pretrained=True)
@@ -106,15 +120,15 @@ def train(*, config='config', resume=False):
                 resnet.layer3,
                 resnet.layer4
             )
-            input_size = 512
-        elif base == None:
-            input_size = 3 * cfg['image_size'] * cfg['image_size']
+            nb_feature_maps = 512
         else:
             raise ValueError(base)
         output_size = 4 + nb_classes
         model = SeqDetect(
-            input_size, output_size, 
             base=base, 
+            input_size=cfg['image_size'],
+            output_size=output_size,
+            nb_feature_maps=nb_feature_maps,
             nb_steps=nb_steps, 
             hidden_size=hidden_size
         )
@@ -133,26 +147,35 @@ def train(*, config='config', resume=False):
         model.cfg = cfg
         print(model)
     
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    #optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
     for epoch in range(first_epoch, num_epoch):
         model.train()
         for batch, samples, in enumerate(train_loader):
             t0 = time.time()
-            X, tb, tc, pb, pc, ob, oc = _predict(model, samples)
+            X, tb, tc, pb, pc, ob, oc, tm, pm = _predict(model, samples)
             model.zero_grad()
             mask = (oc!=0).view(oc.size(0), oc.size(1), 1).float()
-            l_loc = (mask * smooth_l1_loss(pb, ob, size_average=False, reduce=False)).sum() / mask.sum()
+
+            tm = tm.float()
+            #tmv = (tm.view(-1)>0).float()
+            #weight = (tm.view(-1))
+            #pmv = pm.view(-1)
+            #l_mask = (weight * mse_loss(pmv, tmv, size_average=False, reduce=False)).sum() / len(pmv)
+            l_mask = mse_loss(pm.view(-1), tm.view(-1))
+
+            l_loc = (mask * mse_loss(pb, ob, size_average=False, reduce=False)).sum() / mask.sum()
             pc_ = pc.view(pc.size(0) * pc.size(1), pc.size(2))
             oc_ = oc.view(-1)
             l_classif = cross_entropy(pc_, oc_)
-            loss = cfg['lambda_'] * l_loc + l_classif
+            loss = cfg['w_loc'] * l_loc + cfg['w_classif'] * l_classif + cfg['w_mask'] * l_mask
             loss.backward()
             _update_lr(optimizer, model.nb_updates, cfg['lr_schedule'])
             optimizer.step()
             delta = time.time() - t0
 
             print('Epoch {:05d}/{:05d} Batch {:05d}/{:05d} Loss : {:.3f} Loc : {:.3f} '
-                  'Classif : {:.3f} Time:{:.3f}s'.format(
+                    'Classif : {:.3f} Mask : {:.3f} Time:{:.3f}s'.format(
                       epoch + 1,
                       num_epoch,
                       batch + 1, 
@@ -160,11 +183,13 @@ def train(*, config='config', resume=False):
                       loss.data[0], 
                       l_loc.data[0],
                       l_classif.data[0],
+                      l_mask.data[0],
                       delta
                     ))
             train_stats['loss'].append(loss.data[0])
             train_stats['loc'].append(l_loc.data[0])
             train_stats['classif'].append(l_classif.data[0])
+            train_stats['mask'].append(l_mask.data[0])
             train_stats['time'].append(delta)
             if model.nb_updates % cfg['log_interval'] == 0:
                 pd.DataFrame(train_stats).to_csv(train_stats_filename, index=False)
@@ -177,7 +202,9 @@ def train(*, config='config', resume=False):
                 oc = oc.data.cpu().numpy()
                 
                 X = X.data.cpu().numpy()
- 
+                pm = pm.data.cpu().numpy()
+                #pm = sigmoid(pm)
+                tm = tm.data.cpu().numpy()
                 for i in range(len(X)):
                     x = X[i]
                     x = x.transpose((1, 2, 0))
@@ -195,6 +222,14 @@ def train(*, config='config', resume=False):
                     im = _draw_bounding_boxes(im, gt_boxes, color=(1, 0, 0), text_color=(1, 0, 0), pad=pad)
                     im = _draw_bounding_boxes(im, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0), pad=pad) 
                     imsave(os.path.join(out_folder, 'train/sample_{:05d}.jpg'.format(i)), im)
+                    pmask = pm[i][0]>0.5
+                    tmask = tm[i][0]>0.5
+                    im_mask = np.zeros((pmask.shape[0], pmask.shape[1], 3))
+                    im_mask[:, :, 0] = pmask
+                    im_mask[:, :, 1] = tmask
+                    im_mask = np.clip(im_mask, 0, 1)
+                    imsave(os.path.join(out_folder, 'train_mask/sample_{:05d}.jpg'.format(i)), im_mask)
+
             model.nb_updates += 1
         if debug and model.nb_updates % 50 != 0:
             continue
@@ -202,12 +237,13 @@ def train(*, config='config', resume=False):
             continue
         metrics = defaultdict(list)
         print('Evaluation')
+        model.eval()
         for (split_name, loader) in (('train', train_evaluation_loader), ('valid', valid_evaluation_loader)):
             t0 = time.time()
             ex = 0
             for batch, samples, in enumerate(loader):
                 t0 = time.time()
-                X, tb, tc, pb, pc, ob, oc = _predict(model, samples) 
+                X, tb, tc, pb, pc, ob, oc, tm, pm = _predict(model, samples) 
                 ob = ob.data.cpu().numpy() * cfg['image_size']
                 pb = pb.data.cpu().numpy() * cfg['image_size']
                 tb = tb * cfg['image_size']
@@ -215,7 +251,9 @@ def train(*, config='config', resume=False):
                 oc = oc.data.cpu().numpy()
                 
                 X = X.data.cpu().numpy()
- 
+                pm = pm.data.cpu().numpy()
+                #pm = sigmoid(pm)
+                tm = tm.data.cpu().numpy()
                 for i in range(len(X)):
                     x = X[i]
                     x = x.transpose((1, 2, 0))
@@ -249,8 +287,14 @@ def train(*, config='config', resume=False):
                     im = _draw_bounding_boxes(im, gt_boxes, color=(1, 0, 0), text_color=(1, 0, 0), pad=pad)
                     im = _draw_bounding_boxes(im, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0), pad=pad) 
                     imsave(os.path.join(out_folder, 'eval_{}/sample_{:05d}.jpg'.format(split_name, ex)), im)
+                    pmask = pm[i][0]>0.5
+                    tmask = tm[i][0]>0.5
+                    im_mask = np.zeros((pmask.shape[0], pmask.shape[1], 3))
+                    im_mask[:, :, 0] = pmask
+                    im_mask[:, :, 1] = tmask
+                    im_mask = np.clip(im_mask, 0, 1)
+                    imsave(os.path.join(out_folder, 'eval_{}_mask/sample_{:05d}.jpg'.format(split_name, ex)), im_mask)
                     ex += 1
-
                 delta = time.time() - t0
                 print('Eval Batch {:04d}/{:04d} on split {} Time : {:.3f}s'.format(batch, len(loader), split_name, delta))
 
@@ -263,20 +307,26 @@ def train(*, config='config', resume=False):
 
 
 def _predict(model, samples):
-    X = torch.stack([x for x, _ in samples], 0) 
+    X = torch.stack([x for x, _, _ in samples], 0) 
     X = X.cuda()
     X = Variable(X)
-    # X has shape (nb_examples, 3, image_size, image_size)
-    ypred = model(X)
-    # ypred has shape (nb_examples, nb_steps, 4+nb_classes)
 
-    tb = [_pad([b for b, cl in bb], model.nb_steps, size=4) for (_, bb) in samples]
+    tm = torch.stack([m for _, m, _ in samples], 0) 
+    tm = tm.cuda()
+    tm = Variable(tm)
+ 
+    # X has shape (nb_examples, 3, image_size, image_size)
+    ypred, pm = model(X)
+    # ypred has shape (nb_examples, nb_steps, 4+nb_classes)
+    # mpred has shape (nb_examples, 1, image_size, image_size)
+    
+    tb = [_pad([b for b, cl in bb], model.nb_steps, size=4) for (_, _, bb) in samples]
     tb = torch.Tensor(tb)
     # tb = true boxes
     # it has shape (nb_examples, nb_steps, 4) with 0 on all entries for non-boxes
     tb = tb.float()
      
-    tc = [_pad([cl for b, cl in bb], model.nb_steps, size=0) for (_, bb) in samples]
+    tc = [_pad([cl for b, cl in bb], model.nb_steps, size=0) for (_, _, bb) in samples]
     # tc = true classes
     # it has shape (nb_examples, nb_steps) with 0 (background) for non-boxes
     tc = torch.Tensor(tc)
@@ -302,7 +352,7 @@ def _predict(model, samples):
     # om : output masks for each prediction step of the rnn
     ob = Variable(ob).cuda()
     oc = Variable(oc).cuda()
-    return X, tb, tc, pb, pc, ob, oc
+    return X, tb, tc, pb, pc, ob, oc, tm, pm
 
 def build_out_fixed(pb, pc, tb, tc):
     return tb, tc
@@ -494,7 +544,7 @@ def test(filename, *, model='out/model.th', nb_predictions=10, out=None, cuda=Fa
     if cuda:
         X = X.cuda()
     X = Variable(X)
-    ypred = model(X)
+    ypred, mpred = model(X)
     pb = ypred[:, :, 0:4].contiguous()
     pc = ypred[:, :, 4:].contiguous()
     pb = pb.data.cpu().numpy() * model.cfg['image_size']

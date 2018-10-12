@@ -54,12 +54,14 @@ class DetectionDataset(Dataset):
         sw = 1 / orig_w
         sh = 1 / orig_h
         boxes = [((x * sw, y * sh, w * sw, h * sh), cat) for ((x, y, w, h), cat) in boxes]
+        m = _build_mask(x, boxes)
+        m = m.view(1, m.size(0), m.size(1))
         def sort_box(b):
             box, cat = b
             x, y, w, h = box
             return (y+h/2, x+w/2)#sory by y, then by x
         boxes = sorted(boxes, key=sort_box)
-        return x, boxes
+        return x, m, boxes
 
     def __getitem__(self, i):
         return self._load(i)
@@ -187,17 +189,21 @@ class SubSample:
         return self.nb
 
 def _build_mask(im, bboxes):
-    m = torch.zeros(im.size(1), im.size(2)).byte()
+    m = torch.zeros(im.size(1), im.size(2)).float()
     for (x, y, w, h), cat in bboxes:
-        x = int(x)
-        y = int(y)
-        w = int(w)
-        h = int(h)
-        xmin = min(x, m.size(1) - 1)
-        ymin = min(y, m.size(0) - 1)
-        xmax = min(x + w, m.size(1))
-        ymax = min(y + h, m.size(0))
-        m[ymin:ymax, xmin:xmax] = 1
+        x = int(x * m.size(1))
+        y = int(y * m.size(0))
+        w = int(w * m.size(1))
+        h = int(h * m.size(0))
+        w = max(w, 1)
+        h = max(h, 1)
+        xmin = min(x, m.size(1) - w)
+        xmax = x + w 
+        ymin = min(y, m.size(0) - h)
+        ymax = y + h
+        #val = 1 / (w*h)
+        val = 1
+        m[ymin:ymax, xmin:xmax] = val
     return m
 
 def _random_patch(rng, im, scale, aspect_ratio):
